@@ -1,0 +1,17 @@
+# Build outputs & binaries
+build/
+*.exe
+*.o
+*.obj
+*.pdb
+
+# Generated capture files
+*.pcap
+*.pcapng
+
+# IDE / OS artifacts
+.vscode/
+.vs/
+*.user
+Thumbs.db
+.DS_Store
