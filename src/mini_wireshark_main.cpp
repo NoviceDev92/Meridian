@@ -35,19 +35,34 @@ enum ControlId : int {
     ID_LIST_PACKETS   = 1009,
     ID_TREE_DISSECT   = 1010,
     ID_HEX_VIEW       = 1011,
-    ID_STATUS_BAR     = 1012
+    ID_STATUS_BAR     = 1012,
+    ID_BTN_STATS      = 1013
 };
 
+// Per-tree-item data: byte range to highlight, the Wireshark field name
+// (shown in the status bar) and an optional frame to jump to on double-click.
 struct ByteSpan {
     size_t offset = 0;
     size_t length = 0;
+    std::string field;
+    uint32_t link_frame = 0;
 };
+
+// Filter bar colouring, as in Wireshark: green = valid, red = invalid
+enum class FilterState { EMPTY, VALID, INVALID };
 
 struct AppState {
     CaptureSession session{TAP_SNIFFER_PORT, "127.0.0.1"};
     std::vector<DissectedPacket> displayed;
     std::vector<std::unique_ptr<ByteSpan>> tree_spans;
     std::string active_filter;
+    DisplayFilter compiled_filter;
+    FilterState filter_state = FilterState::EMPTY;
+    std::string filter_error;
+    std::string selected_field;
+    uint64_t seen_reorder_gen = 0;
+    HBRUSH brush_valid   = nullptr;
+    HBRUSH brush_invalid = nullptr;
 
     int selected_row        = -1;
     size_t highlight_offset = 0;
@@ -60,6 +75,7 @@ struct AppState {
     HWND hwnd_btn_opn = nullptr;
     HWND hwnd_btn_sav = nullptr;
     HWND hwnd_btn_dem = nullptr;
+    HWND hwnd_btn_sta = nullptr;
     HWND hwnd_flt_lbl = nullptr;
     HWND hwnd_flt_edt = nullptr;
     HWND hwnd_btn_apl = nullptr;
@@ -81,6 +97,10 @@ LRESULT CALLBACK FilterEditProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         SendMessage(g_app->hwnd_main, WM_COMMAND, ID_BTN_APPLY_FLT, 0);
         return 0;
     }
+    if (msg == WM_CHAR && (wParam == '\r' || wParam == 1)) {
+        if (wParam == 1) SendMessage(hwnd, EM_SETSEL, 0, -1);  // Ctrl+A = select all
+        return 0;                                              // swallow (no beep)
+    }
     return CallWindowProcA(g_orig_edit_proc, hwnd, msg, wParam, lParam);
 }
 
@@ -89,11 +109,26 @@ LRESULT CALLBACK FilterEditProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 // ============================================================================
 constexpr const char* HEX_VIEW_CLASS = "MiniWiresharkHexView";
 
-void update_hex_scrollbar(HWND hwnd) {
+// Line height of the hex pane, from the monospace font (must match WM_PAINT).
+int hex_line_height(HWND hwnd) {
+    int line_h = 18;
+    if (g_app && g_app->mono_font) {
+        HDC hdc = GetDC(hwnd);
+        HFONT old = static_cast<HFONT>(SelectObject(hdc, g_app->mono_font));
+        TEXTMETRICA tm{};
+        GetTextMetricsA(hdc, &tm);
+        SelectObject(hdc, old);
+        ReleaseDC(hwnd, hdc);
+        line_h = std::max(18, static_cast<int>(tm.tmHeight + 4));
+    }
+    return line_h;
+}
+
+void update_hex_scrollbar(HWND hwnd, bool reset_pos = false) {
     if (!g_app) return;
     RECT rc{};
     GetClientRect(hwnd, &rc);
-    int line_h = 18;
+    int line_h = hex_line_height(hwnd);
     int visible_lines = std::max(1, static_cast<int>((rc.bottom - rc.top) / line_h));
 
     size_t byte_len = 0;
@@ -109,8 +144,17 @@ void update_hex_scrollbar(HWND hwnd) {
     si.nMin   = 0;
     si.nMax   = std::max(0, total_lines - 1);
     si.nPage  = static_cast<UINT>(visible_lines);
-    GetScrollInfo(hwnd, SB_VERT, &si);
-    si.fMask  = SIF_RANGE | SIF_PAGE;
+    si.nPos   = 0;
+    // BUG FIX: the original called GetScrollInfo() here, which overwrote the
+    // freshly computed range/page with the OLD values, so the scrollbar never
+    // matched the selected frame's size. Only keep the old position.
+    if (!reset_pos) {
+        SCROLLINFO cur{};
+        cur.cbSize = sizeof(cur);
+        cur.fMask  = SIF_POS;
+        GetScrollInfo(hwnd, SB_VERT, &cur);
+        si.nPos = std::min(cur.nPos, si.nMax);
+    }
     SetScrollInfo(hwnd, SB_VERT, &si, TRUE);
 }
 
@@ -170,7 +214,11 @@ LRESULT CALLBACK HexViewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             FillRect(hdc, &rc, bg);
             DeleteObject(bg);
 
-            if (!g_app || g_app->selected_row < 0 ||
+            if (!g_app) {
+                EndPaint(hwnd, &ps);
+                return 0;
+            }
+            if (g_app->selected_row < 0 ||
                 g_app->selected_row >= static_cast<int>(g_app->displayed.size())) {
                 SelectObject(hdc, g_app->ui_font);
                 SetBkMode(hdc, TRANSPARENT);
@@ -260,20 +308,31 @@ LRESULT CALLBACK HexViewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 void update_status_bar() {
     if (!g_app || !g_app->hwnd_status) return;
     std::ostringstream oss;
+    if (g_app->filter_state == FilterState::INVALID) {
+        // Like Wireshark: explain why the filter bar is red
+        oss << "Filter error: " << g_app->filter_error << " (Apply = plain text search)";
+        SendMessageA(g_app->hwnd_status, SB_SETTEXTA, 0, reinterpret_cast<LPARAM>(oss.str().c_str()));
+        return;
+    }
     oss << (g_app->session.is_running()
                 ? ("Capturing on 127.0.0.1:" + std::to_string(g_app->session.bound_port()))
                 : "Capture Stopped")
-        << "   |   Total Packets: " << g_app->session.count()
+        << "   |   Packets: " << g_app->session.count()
         << "   |   Displayed: " << g_app->displayed.size();
+    if (!g_app->selected_field.empty()) {
+        oss << "   |   Field: " << g_app->selected_field;
+    }
     if (g_app->highlight_length > 0) {
-        oss << "   |   Selected Bytes: offset=" << g_app->highlight_offset
-            << ", len=" << g_app->highlight_length;
+        oss << "   |   Bytes " << g_app->highlight_offset << "-"
+            << (g_app->highlight_offset + g_app->highlight_length - 1)
+            << " (" << g_app->highlight_length << ")";
     }
     SendMessageA(g_app->hwnd_status, SB_SETTEXTA, 0, reinterpret_cast<LPARAM>(oss.str().c_str()));
 }
 
 void insert_tree_node(HTREEITEM parent, const DissectNode& node, bool expand) {
-    auto span = std::make_unique<ByteSpan>(ByteSpan{node.byte_offset, node.byte_length});
+    auto span = std::make_unique<ByteSpan>(
+        ByteSpan{node.byte_offset, node.byte_length, node.field, node.link_frame});
     LPARAM lparam = reinterpret_cast<LPARAM>(span.get());
     g_app->tree_spans.push_back(std::move(span));
 
@@ -297,6 +356,7 @@ void populate_dissector_for_row(int row) {
     g_app->selected_row     = row;
     g_app->highlight_offset = 0;
     g_app->highlight_length = 0;
+    g_app->selected_field.clear();
 
     TreeView_DeleteAllItems(g_app->hwnd_tree);
     g_app->tree_spans.clear();
@@ -310,7 +370,7 @@ void populate_dissector_for_row(int row) {
         }
     }
 
-    update_hex_scrollbar(g_app->hwnd_hex);
+    update_hex_scrollbar(g_app->hwnd_hex, true);
     InvalidateRect(g_app->hwnd_hex, nullptr, TRUE);
     update_status_bar();
 }
@@ -345,7 +405,8 @@ void refresh_packet_list(bool preserve_selection = true) {
         prev_num = g_app->displayed[g_app->selected_row].number;
     }
 
-    g_app->displayed = g_app->session.snapshot(g_app->active_filter);
+    g_app->displayed = g_app->session.snapshot(g_app->compiled_filter);
+    g_app->seen_reorder_gen = g_app->session.reorder_generation();
 
     SendMessage(g_app->hwnd_list, WM_SETREDRAW, FALSE, 0);
     ListView_DeleteAllItems(g_app->hwnd_list);
@@ -367,14 +428,22 @@ void refresh_packet_list(bool preserve_selection = true) {
 }
 
 void sync_new_packets() {
-    auto latest = g_app->session.snapshot(g_app->active_filter);
+    // Frames were re-ordered/renumbered (out-of-order tap arrival): redraw all
+    if (g_app->session.reorder_generation() != g_app->seen_reorder_gen) {
+        refresh_packet_list(true);
+        return;
+    }
+    auto latest = g_app->session.snapshot(g_app->compiled_filter);
     if (latest.size() < g_app->displayed.size()) {
         refresh_packet_list(false);
         return;
     }
-    for (size_t i = g_app->displayed.size(); i < latest.size(); ++i) {
-        g_app->displayed.push_back(latest[i]);
-        append_listview_row(latest[i], static_cast<int>(i));
+    size_t old_n = g_app->displayed.size();
+    // Replace existing copies too: an older request gains "[Response In: N]"
+    // once its response arrives.
+    g_app->displayed = std::move(latest);
+    for (size_t i = old_n; i < g_app->displayed.size(); ++i) {
+        append_listview_row(g_app->displayed[i], static_cast<int>(i));
     }
     if (!g_app->displayed.empty()) {
         ListView_EnsureVisible(g_app->hwnd_list, static_cast<int>(g_app->displayed.size()) - 1, FALSE);
@@ -462,6 +531,50 @@ void trigger_builtin_demo() {
 }
 
 // ============================================================================
+// Display filter bar (live validation) / Statistics / Frame navigation
+// ============================================================================
+void validate_filter_text() {
+    char buf[512]{};
+    GetWindowTextA(g_app->hwnd_flt_edt, buf, sizeof(buf));
+    DisplayFilter f = DisplayFilter::compile(buf);
+    if (f.empty())       g_app->filter_state = FilterState::EMPTY;
+    else if (f.valid())  g_app->filter_state = FilterState::VALID;
+    else                 g_app->filter_state = FilterState::INVALID;
+    g_app->filter_error = f.error();
+    InvalidateRect(g_app->hwnd_flt_edt, nullptr, TRUE);
+    update_status_bar();
+}
+
+void apply_filter_from_edit() {
+    char buf[512]{};
+    GetWindowTextA(g_app->hwnd_flt_edt, buf, sizeof(buf));
+    g_app->active_filter   = buf;
+    g_app->compiled_filter = DisplayFilter::compile(buf);
+    refresh_packet_list(false);
+}
+
+void show_statistics() {
+    std::string text = g_app->session.statistics().to_string();
+    MessageBoxA(g_app->hwnd_main, text.c_str(), "Mini-Wireshark - Capture Statistics",
+                MB_OK | MB_ICONINFORMATION);
+}
+
+// Selects the packet-list row holding frame `frame_no` (if it passes the filter).
+bool select_frame(uint32_t frame_no) {
+    for (size_t i = 0; i < g_app->displayed.size(); ++i) {
+        if (g_app->displayed[i].number == frame_no) {
+            int row = static_cast<int>(i);
+            ListView_SetItemState(g_app->hwnd_list, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+            ListView_SetItemState(g_app->hwnd_list, row, LVIS_SELECTED | LVIS_FOCUSED,
+                                  LVIS_SELECTED | LVIS_FOCUSED);
+            ListView_EnsureVisible(g_app->hwnd_list, row, FALSE);
+            return true;
+        }
+    }
+    return false;
+}
+
+// ============================================================================
 // Layout & File Dialogs
 // ============================================================================
 void layout_controls(int w, int h) {
@@ -481,7 +594,8 @@ void layout_controls(int w, int h) {
     MoveWindow(g_app->hwnd_btn_clr, pad + 111, y, 70, bar_h, TRUE);
     MoveWindow(g_app->hwnd_btn_opn, pad + 187, y, 95, bar_h, TRUE);
     MoveWindow(g_app->hwnd_btn_sav, pad + 288, y, 95, bar_h, TRUE);
-    MoveWindow(g_app->hwnd_btn_dem, pad + 395, y, 145, bar_h, TRUE);
+    MoveWindow(g_app->hwnd_btn_dem, pad + 389, y, 170, bar_h, TRUE);
+    MoveWindow(g_app->hwnd_btn_sta, pad + 565, y, 90, bar_h, TRUE);
 
     // Row 2: Display Filter Bar
     y += bar_h + pad;
@@ -532,15 +646,19 @@ void open_pcap_dialog() {
     OPENFILENAMEA ofn{};
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner   = g_app->hwnd_main;
-    ofn.lpstrFilter = "PCAP Files (*.pcap)\0*.pcap\0All Files (*.*)\0*.*\0";
+    ofn.lpstrFilter = "Capture Files (*.pcap;*.pcapng;*.cap)\0*.pcap;*.pcapng;*.cap\0All Files (*.*)\0*.*\0";
     ofn.lpstrFile   = file_buf;
     ofn.nMaxFile    = MAX_PATH;
     ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
     if (GetOpenFileNameA(&ofn)) {
-        if (g_app->session.import_pcap(file_buf)) {
+        // Stop live capture first, otherwise new tap packets would mix with the file
+        if (g_app->session.is_running()) stop_capture();
+        std::string err;
+        if (g_app->session.import_pcap(file_buf, &err)) {
             refresh_packet_list(false);
         } else {
-            MessageBoxA(g_app->hwnd_main, "Failed to load .pcap file.", "Mini-Wireshark", MB_ICONERROR);
+            std::string msg = "Failed to load capture file: " + err;
+            MessageBoxA(g_app->hwnd_main, msg.c_str(), "Mini-Wireshark", MB_ICONERROR);
         }
     }
 }
@@ -594,13 +712,16 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             g_app->hwnd_btn_opn = make_ctrl("BUTTON", "Open .pcap", BS_PUSHBUTTON, 0, ID_BTN_OPEN_PCAP);
             g_app->hwnd_btn_sav = make_ctrl("BUTTON", "Save .pcap", BS_PUSHBUTTON, 0, ID_BTN_SAVE_PCAP);
             g_app->hwnd_btn_dem = make_ctrl("BUTTON", "Run BOOTP+DNS Demo", BS_PUSHBUTTON, 0, ID_BTN_RUN_DEMO);
+            g_app->hwnd_btn_sta = make_ctrl("BUTTON", "Statistics", BS_PUSHBUTTON, 0, ID_BTN_STATS);
+            g_app->brush_valid   = CreateSolidBrush(RGB(175, 255, 175));
+            g_app->brush_invalid = CreateSolidBrush(RGB(255, 175, 175));
 
             g_app->hwnd_flt_lbl = make_ctrl("STATIC", "Display Filter:", SS_LEFT, 0, 0);
             g_app->hwnd_flt_edt = make_ctrl("EDIT", "", ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, ID_EDIT_FILTER);
             g_orig_edit_proc = reinterpret_cast<WNDPROC>(
                 SetWindowLongPtrA(g_app->hwnd_flt_edt, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(FilterEditProc)));
             SendMessageA(g_app->hwnd_flt_edt, EM_SETCUEBANNER, TRUE,
-                         reinterpret_cast<LPARAM>(L"e.g. bootp, dns, ip == 192.168.10.2, port == 9053"));
+                         reinterpret_cast<LPARAM>(L"e.g.  dns && dns.flags.rcode == 3   |   bootp.hops > 0   |   ip.addr == 192.168.10.0/24 && !dns"));
             g_app->hwnd_btn_apl = make_ctrl("BUTTON", "Apply", BS_PUSHBUTTON, 0, ID_BTN_APPLY_FLT);
             g_app->hwnd_btn_clf = make_ctrl("BUTTON", "Reset", BS_PUSHBUTTON, 0, ID_BTN_CLEAR_FLT);
 
@@ -647,6 +768,16 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             layout_controls(LOWORD(lParam), HIWORD(lParam));
             return 0;
         }
+        case WM_CTLCOLOREDIT: {
+            HWND ctl = reinterpret_cast<HWND>(lParam);
+            if (ctl == g_app->hwnd_flt_edt && g_app->filter_state != FilterState::EMPTY) {
+                HDC hdc = reinterpret_cast<HDC>(wParam);
+                bool ok = (g_app->filter_state == FilterState::VALID);
+                SetBkColor(hdc, ok ? RGB(175, 255, 175) : RGB(255, 175, 175));
+                return reinterpret_cast<LRESULT>(ok ? g_app->brush_valid : g_app->brush_invalid);
+            }
+            return DefWindowProcA(hwnd, msg, wParam, lParam);
+        }
         case WM_APP_NEW_PACKET: {
             sync_new_packets();
             return 0;
@@ -671,17 +802,20 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                     if (!g_app->session.is_running()) start_capture();
                     trigger_builtin_demo();
                     break;
-                case ID_BTN_APPLY_FLT: {
-                    char buf[256]{};
-                    GetWindowTextA(g_app->hwnd_flt_edt, buf, sizeof(buf));
-                    g_app->active_filter = buf;
-                    refresh_packet_list(false);
+                case ID_BTN_APPLY_FLT:
+                    apply_filter_from_edit();
                     break;
-                }
                 case ID_BTN_CLEAR_FLT:
                     SetWindowTextA(g_app->hwnd_flt_edt, "");
                     g_app->active_filter.clear();
+                    g_app->compiled_filter = DisplayFilter{};
                     refresh_packet_list(false);
+                    break;
+                case ID_BTN_STATS:
+                    show_statistics();
+                    break;
+                case ID_EDIT_FILTER:
+                    if (HIWORD(wParam) == EN_CHANGE) validate_filter_text();
                     break;
             }
             return 0;
@@ -703,10 +837,14 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                         int idx = static_cast<int>(cd->nmcd.dwItemSpec);
                         if (idx >= 0 && idx < static_cast<int>(g_app->displayed.size())) {
                             const auto& pkt = g_app->displayed[idx];
-                            if (pkt.info.find("NXDOMAIN") != std::string::npos ||
+                            if (pkt.expert_level == ExpertLevel::Error) {
+                                cd->clrTextBk = RGB(255, 92, 92);   // Bad checksum / malformed
+                            } else if (pkt.info.find("NXDOMAIN") != std::string::npos ||
                                 pkt.info.find("SERVFAIL") != std::string::npos) {
                                 cd->clrTextBk = RGB(255, 224, 224); // Light red for errors
-                            } else if (pkt.protocol == "BOOTP") {
+                            } else if (pkt.retransmission_of != 0) {
+                                cd->clrTextBk = RGB(255, 245, 190); // Pale yellow: retransmission
+                            } else if (pkt.protocol == "BOOTP" || pkt.protocol == "DHCP") {
                                 cd->clrTextBk = RGB(232, 248, 225); // Wireshark mint-green for BOOTP
                             } else if (pkt.protocol == "DNS") {
                                 cd->clrTextBk = RGB(224, 240, 255); // Wireshark sky-blue for DNS
@@ -718,10 +856,31 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                         return CDRF_NEWFONT;
                     }
                 }
+            } else if (nm->idFrom == ID_TREE_DISSECT && nm->code == NM_DBLCLK) {
+                // Double-click "[Response In: N]" / "[Request In: N]" to jump
+                HTREEITEM sel = TreeView_GetSelection(g_app->hwnd_tree);
+                if (sel) {
+                    TVITEMA item{};
+                    item.mask  = TVIF_PARAM;
+                    item.hItem = sel;
+                    if (TreeView_GetItem(g_app->hwnd_tree, &item)) {
+                        auto* span = reinterpret_cast<ByteSpan*>(item.lParam);
+                        if (span && span->link_frame != 0) {
+                            uint32_t target = span->link_frame;  // span dies on repopulate
+                            if (!select_frame(target)) {
+                                MessageBoxA(g_app->hwnd_main,
+                                            "That frame is hidden by the current display filter.",
+                                            "Mini-Wireshark", MB_ICONINFORMATION);
+                            }
+                            return TRUE;
+                        }
+                    }
+                }
             } else if (nm->idFrom == ID_TREE_DISSECT && nm->code == TVN_SELCHANGED) {
                 NMTREEVIEWA* ptv = reinterpret_cast<NMTREEVIEWA*>(lParam);
                 auto* span = reinterpret_cast<ByteSpan*>(ptv->itemNew.lParam);
                 if (span) {
+                    g_app->selected_field   = span->field;
                     g_app->highlight_offset = span->offset;
                     g_app->highlight_length = span->length;
                     scroll_hex_to_highlight(g_app->hwnd_hex);
@@ -734,6 +893,8 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         case WM_DESTROY: {
             g_app->session.stop();
             if (g_app->ui_font) DeleteObject(g_app->ui_font);
+            if (g_app->brush_valid) DeleteObject(g_app->brush_valid);
+            if (g_app->brush_invalid) DeleteObject(g_app->brush_invalid);
             if (g_app->mono_font) DeleteObject(g_app->mono_font);
             PostQuitMessage(0);
             return 0;

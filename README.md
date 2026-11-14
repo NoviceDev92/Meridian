@@ -31,6 +31,28 @@ A modular C++17 networking lab project implementing **BOOTP** and **DNS** from s
      - **Pane 3 (Hex + ASCII Inspector)**: Custom GDI hex/ASCII view that highlights exact byte ranges when selecting any tree field.
      - **Toolbar & Filter**: Start/Stop Capture, Clear, Open/Save `.pcap`, Display Filter (`bootp`, `dns`, `ip == ...`, `port == ...`), and one-click **Run BOOTP+DNS Demo** button.
 
+6. **Phase 6 — Wireshark-Fidelity Upgrade** *(Completed)*
+   - `include/display_filter.hpp`: Real Wireshark display-filter language — Wireshark field names (`ip.src`, `udp.port`, `dns.qry.name`, `dns.flags.rcode`, `bootp.option.domain_name_server`, ...), operators `== != > < >= <= contains matches`, `&& || !` / `and or not`, parentheses, CIDR (`ip.addr == 192.168.10.0/24`). Old syntax (`bootp`, `ip == x`, `port == n`) still works.
+   - `include/analysis.hpp`: Request/response pairing (`[Response In: N]`, `[Request In: N]`, `[Time: …]`, `dns.time`), retransmission detection, capture statistics, and loopback-address resolution so replies show the client's lab IP instead of `127.0.0.1`.
+   - `include/dissector.hpp`: IPv4 header + UDP checksum verification (`[correct]` / `[incorrect, should be …]`, checksum-offload aware), bit-level flag views (`1... .... = Response`), Expert Info (malformed packets, bad checksums), DHCP option names (53, 50, 54, 55, 61…), extra DNS types (AAAA, MX, TXT, SOA, OPT).
+   - `include/pcap_writer.hpp`: Reads classic pcap (either byte order, µs or ns timestamps) **and pcapng** (Wireshark's default save format). Exports now carry real epoch timestamps and valid UDP checksums, so genuine Wireshark shows the right date and "[correct]".
+   - GUI: filter bar turns green/red as you type (with the error in the status bar), double-click `[Response In: N]` to jump, selected field name in the status bar, Statistics dialog, fixed hex-pane scrollbar.
+   - CLI: `sniffer_cli --read capture.pcapng --filter "dns.time > 0.001" --tree --stats`.
+   - `src/phase5_test.cpp`: tests for all of the above.
+
+### Display filter cheat sheet
+
+| Goal | Filter |
+|---|---|
+| NXDOMAIN answers | `dns.flags.rcode == 3` |
+| Everything to/from the lab subnet except DNS | `ip.addr == 192.168.10.0/24 && !dns` |
+| Relayed BOOTP | `bootp.hops > 0` |
+| Lookups for a domain | `dns.qry.name contains "university"` |
+| Slow DNS answers (> 1 ms) | `dns.time > 0.001` |
+| Queries that never got an answer | `dns.flags.response == 0 && !dns.response_in` |
+| Retransmissions | `bootp.retransmission \|\| dns.retransmission` |
+| Damaged frames | `_ws.malformed \|\| udp.checksum.status == bad` |
+
 ## Building All Targets (Windows MSYS2 / MinGW g++)
 
 ```powershell

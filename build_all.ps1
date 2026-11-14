@@ -11,6 +11,7 @@ try {
         "phase2_test",
         "phase3_test",
         "phase4_test",
+        "phase5_test",
         "bootp_server_main:bootp_server",
         "bootp_relay_main:bootp_relay",
         "bootp_client_main:bootp_client",
@@ -33,7 +34,7 @@ try {
     & g++ @Flags -mwindows "src/mini_wireshark_main.cpp" -o "$BuildDir/mini_wireshark.exe" -lws2_32 -lcomctl32 -lcomdlg32 -lgdi32
     if ($LASTEXITCODE -ne 0) { throw "Build failed for mini_wireshark.exe" }
 
-    Write-Host "`nAll 12 targets built successfully in group_project/$BuildDir"
+    Write-Host "`nAll 13 targets built successfully in group_project/$BuildDir"
 } finally {
     Pop-Location
 }

@@ -302,8 +302,8 @@ private:
         rep.add_u32_option(BootpOptionTag::LEASE_TIME, cfg_.lease_secs);
 
         auto rep_bytes = rep.serialize();
-        sock_.send_to(rep_bytes, peer_ip, peer_port);
-
+        // Mirror to the tap FIRST so the capture timestamp precedes the real
+        // send (a fast peer's reply can then never be stamped earlier).
         if (cfg_.enable_tap) {
             std::string tap_dst = (req.giaddr != 0)
                                       ? ipv4_to_string(req.giaddr)
@@ -312,6 +312,7 @@ private:
                       AppProtoHint::BOOTP, rep_bytes,
                       {0x02, 0x00, 0x00, 0xAA, 0xBB, 0x01}, mac);
         }
+        sock_.send_to(rep_bytes, peer_ip, peer_port);
 
         if (verbose) {
             std::cout << "[BOOTP SERVER] BOOTREQUEST (" << mac_str << ", xid=0x"
@@ -406,8 +407,8 @@ private:
                 pending_[pkt.xid] = {src_ip, src_port};
             }
             auto fwd = pkt.serialize();
-            server_facing_.send_to(fwd, cfg_.server_ip, cfg_.server_port);
-
+            // Mirror to the tap FIRST so the capture timestamp precedes the real
+            // send (a fast peer's reply can then never be stamped earlier).
             if (cfg_.enable_tap) {
                 tap_.emit(cfg_.relay_ip, server_facing_.local_port(),
                           cfg_.server_ip, cfg_.server_port,
@@ -415,6 +416,7 @@ private:
                           {0x02, 0x00, 0x00, 0xCC, 0xDD, 0x01},
                           {0x02, 0x00, 0x00, 0xAA, 0xBB, 0x01});
             }
+            server_facing_.send_to(fwd, cfg_.server_ip, cfg_.server_port);
             if (verbose) {
                 std::cout << "[BOOTP RELAY] Forwarded BOOTREQUEST (xid=0x"
                           << std::hex << pkt.xid << std::dec
@@ -443,13 +445,15 @@ private:
                 pending_.erase(it);
             }
 
-            client_facing_.send_to(buf, target.ip, target.port);
+            // Mirror to the tap FIRST so the capture timestamp precedes the real
+            // send (a fast peer's reply can then never be stamped earlier).
             if (cfg_.enable_tap) {
                 tap_.emit(cfg_.relay_ip, bound_port(),
                           ipv4_to_string(pkt.yiaddr), target.port,
                           AppProtoHint::BOOTP, buf,
                           {0x02, 0x00, 0x00, 0xCC, 0xDD, 0x01}, pkt.get_mac());
             }
+            client_facing_.send_to(buf, target.ip, target.port);
             if (verbose) {
                 std::cout << "[BOOTP RELAY] Relayed BOOTREPLY (xid=0x"
                           << std::hex << pkt.xid << std::dec
@@ -544,13 +548,18 @@ public:
 
             auto wire = req.serialize();
             sock.set_timeout_ms(timeout_ms);
-            sock.send_to(wire, opts_.target_ip, opts_.target_port);
-
+            // Mirror to the tap FIRST so the capture timestamp precedes the real
+            // send (a fast peer's reply can then never be stamped earlier).
             if (opts_.enable_tap) {
+                // On a real LAN an unconfigured client has no IP and does not
+                // know the server, so it sends 0.0.0.0 -> 255.255.255.255.
+                // Show that instead of our loopback transport address.
+                const bool loopback = opts_.target_ip.rfind("127.", 0) == 0;
                 tap_.emit("0.0.0.0", sock.local_port(),
-                          opts_.broadcast ? "255.255.255.255" : opts_.target_ip,
+                          (opts_.broadcast || loopback) ? "255.255.255.255" : opts_.target_ip,
                           opts_.target_port, AppProtoHint::BOOTP, wire, mac);
             }
+            sock.send_to(wire, opts_.target_ip, opts_.target_port);
 
             state_ = BootpClientState::WAITING_REPLY;
             log_state("Attempt " + std::to_string(attempt) + "/" +

@@ -48,8 +48,12 @@ public:
     SocketRuntime& operator=(const SocketRuntime&) = delete;
 };
 
+// Capture timestamps must be wall-clock (microseconds since the Unix epoch):
+// the .pcap format stores ts_sec/ts_usec as epoch time. steady_clock counts
+// from an arbitrary point (often system boot), which made exported captures
+// show dates in January 1970 when opened in real Wireshark.
 inline uint64_t current_time_us() {
-    auto now = std::chrono::steady_clock::now().time_since_epoch();
+    auto now = std::chrono::system_clock::now().time_since_epoch();
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(now).count());
 }

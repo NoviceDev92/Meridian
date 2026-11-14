@@ -324,13 +324,14 @@ private:
         fwd.questions.push_back(q);
 
         auto fwd_bytes = fwd.serialize();
-        up_sock.send_to(fwd_bytes, cfg_.upstream_ip, cfg_.upstream_port);
-
+        // Mirror to the tap FIRST so the capture timestamp precedes the real
+        // send (a fast peer's reply can then never be stamped earlier).
         if (cfg_.enable_tap) {
             tap_.emit(cfg_.server_ip, up_sock.local_port(),
                       cfg_.upstream_logical_ip, cfg_.upstream_port,
                       AppProtoHint::DNS, fwd_bytes);
         }
+        up_sock.send_to(fwd_bytes, cfg_.upstream_ip, cfg_.upstream_port);
 
         if (verbose) {
             std::cout << "[DNS SERVER]   -> Forwarding '" << q.qname
@@ -428,12 +429,13 @@ private:
         }
 
         auto resp_bytes = resp.serialize();
-        sock_.send_to(resp_bytes, peer_ip, peer_port);
-
+        // Mirror to the tap FIRST so the capture timestamp precedes the real
+        // send (a fast peer's reply can then never be stamped earlier).
         if (cfg_.enable_tap) {
             tap_.emit(cfg_.server_ip, bound_port(), peer_ip, peer_port,
                       AppProtoHint::DNS, resp_bytes);
         }
+        sock_.send_to(resp_bytes, peer_ip, peer_port);
 
         if (verbose) {
             std::cout << "[DNS SERVER] Query '" << q.qname << "' (" << dns_type_name(q.qtype)
@@ -509,13 +511,14 @@ public:
 
         for (uint32_t attempt = 1; attempt <= opts_.max_retries; ++attempt) {
             sock.set_timeout_ms(opts_.timeout_ms);
-            sock.send_to(wire, opts_.server_ip, opts_.server_port);
-
+            // Mirror to the tap FIRST so the capture timestamp precedes the real
+            // send (a fast peer's reply can then never be stamped earlier).
             if (opts_.enable_tap) {
                 tap_.emit(opts_.logical_client_ip, sock.local_port(),
                           opts_.logical_server_ip, opts_.server_port,
                           AppProtoHint::DNS, wire);
             }
+            sock.send_to(wire, opts_.server_ip, opts_.server_port);
 
             if (opts_.verbose) {
                 std::cout << "[DNS CLIENT] Querying " << opts_.logical_server_ip

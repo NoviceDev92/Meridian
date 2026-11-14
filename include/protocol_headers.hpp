@@ -73,6 +73,44 @@ inline std::array<uint8_t, 6> mac_from_string(const std::string& str) {
 }
 
 // ============================================================================
+// RFC 1071 Internet Checksum (shared by IPv4 header + UDP pseudo-header sums)
+// ============================================================================
+// Adds 16-bit big-endian words into a 32-bit accumulator. An odd trailing
+// byte is padded with a zero low byte, as RFC 1071 specifies.
+inline uint32_t checksum_accumulate(const uint8_t* data, size_t len, uint32_t sum = 0) {
+    for (size_t i = 0; i + 1 < len; i += 2) {
+        sum += (static_cast<uint32_t>(data[i]) << 8) | data[i + 1];
+    }
+    if (len & 1) {
+        sum += static_cast<uint32_t>(data[len - 1]) << 8;
+    }
+    return sum;
+}
+
+// Folds the carries back into 16 bits and takes the one's complement.
+inline uint16_t checksum_finish(uint32_t sum) {
+    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    return static_cast<uint16_t>(~sum & 0xFFFF);
+}
+
+// UDP checksum over the IPv4 pseudo-header (src, dst, zero, proto=17,
+// UDP length) followed by the UDP header + payload (RFC 768). The checksum
+// field inside `udp` must be zero when computing, or hold the transmitted
+// value when verifying (a correct segment then folds to 0x0000).
+inline uint16_t udp_checksum_ipv4(uint32_t src_ip, uint32_t dst_ip,
+                                  const uint8_t* udp, size_t udp_len) {
+    uint32_t sum = 0;
+    sum += (src_ip >> 16) & 0xFFFF;
+    sum += src_ip & 0xFFFF;
+    sum += (dst_ip >> 16) & 0xFFFF;
+    sum += dst_ip & 0xFFFF;
+    sum += 17; // zero byte + protocol number
+    sum += static_cast<uint32_t>(udp_len);
+    sum = checksum_accumulate(udp, udp_len, sum);
+    return checksum_finish(sum);
+}
+
+// ============================================================================
 // Bounds-Checked Big-Endian Wire Buffer Reader / Writer
 // ============================================================================
 class PacketWriter {
@@ -690,23 +728,27 @@ struct TapEnvelope {
         w.write_u32(src_ip);
         w.write_u32(dst_ip);
 
-        // Compute IPv4 Header Checksum
-        uint32_t sum = 0;
-        const auto& raw = w.data();
-        for (size_t i = ip_start; i < ip_start + 20; i += 2) {
-            sum += (static_cast<uint16_t>(raw[i]) << 8) | raw[i + 1];
-        }
-        while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
-        w.patch_u16(ip_csum_pos, static_cast<uint16_t>(~sum & 0xFFFF));
+        // Compute IPv4 Header Checksum (RFC 1071, header only)
+        w.patch_u16(ip_csum_pos,
+                    checksum_finish(checksum_accumulate(w.data().data() + ip_start, 20)));
 
         // 3. UDP Header (8 bytes)
+        size_t udp_start = w.size();
         w.write_u16(src_port);
         w.write_u16(dst_port);
         w.write_u16(udp_len);
-        w.write_u16(0x0000); // Optional checksum (0 = disabled for IPv4)
+        size_t udp_csum_pos = w.size();
+        w.write_u16(0x0000); // Checksum placeholder (filled below)
 
         // 4. Application Payload (BOOTP / DNS)
         w.write_bytes(payload.data(), payload.size());
+
+        // 5. Real UDP checksum over pseudo-header + segment, so that genuine
+        //    Wireshark shows "[correct]" when it opens our exported .pcap.
+        //    RFC 768: a computed 0x0000 is sent as 0xFFFF (0 means "none").
+        uint16_t udp_csum = udp_checksum_ipv4(src_ip, dst_ip,
+                                              w.data().data() + udp_start, udp_len);
+        w.patch_u16(udp_csum_pos, udp_csum == 0 ? 0xFFFF : udp_csum);
         return w.data();
     }
 
